@@ -1,207 +1,115 @@
-"""
-Evaporator temperature optimizer for a single-room domestic AC.
-
-Goal: given a desired room setpoint and ambient conditions, find the
-evaporating temperature (T_evap) that meets the required cooling load
-with the LEAST compressor work, subject to two physical constraints:
-
-  1. FROST CONSTRAINT (evaporator side)
-     Frost forms on the coil only when it is BOTH below freezing AND
-     below the dew point of the air passing over it (i.e. there is
-     liquid moisture available to freeze). If T_evap is below freezing
-     but ABOVE the dew point, no condensation happens at all, so there
-     is nothing to freeze. We compute dew point from room temp + RH
-     (Magnus-Tetens) and clamp T_evap so frost never forms.
-
-  2. CRITICAL POINT CONSTRAINT (condenser side)
-     The condensing temperature must stay below the refrigerant's
-     critical temperature, or it physically cannot condense (the cycle
-     breaks down / goes supercritical). T_cond is solved from a heat
-     balance: Q_cond = Q_evap + W_compressor = UA_cond * (T_cond - T_outdoor),
-     iterated because W depends on T_cond through COP. If the solved
-     T_cond would exceed the critical point, that operating condition
-     is flagged infeasible.
-
-Why the lowest-work T_evap is simply "as warm as possible": COP rises
-monotonically with T_evap (smaller lift = less compressor work), so the
-optimal strategy is always to run the WARMEST evaporator temperature that
-still satisfies the load -- i.e. solve the energy balance directly rather
-than searching. The frost limit is the only thing that can force T_evap
-colder than that ideal (never warmer), so minimal work = the analytic
-T_evap, clipped only if frost forces it up.
-
-Output: a CSV of (inputs -> T_evap, T_cond, COP, work) rows you can train
-an ML model on, either to predict T_evap directly or to learn the whole
-input -> work mapping.
-"""
-
-import numpy as np
 import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
 
-np.random.seed(42)
+# ---------------------------------------------------------
+# 1. LOAD DATA & TRAIN THE ADVANCED ML MODEL
+# ---------------------------------------------------------
+# Load the historical dataset
+data = pd.read_csv('single_room_evap_temp_data.csv')
+features = ['setpoint_c', 'humidity_pct', 'outdoor_temp_c', 'occupancy', 'evap_temp_c']
+target = 'compressor_work_kwh'
 
-# ---------------------------------------------------------------------
-# Tunable system parameters -- edit to match your real unit/room
-# ---------------------------------------------------------------------
-ROOM_PARAMS = {
-    "insulation_quality": 0.7,     # 0 (poor) - 1 (excellent)
-    "room_area_m2": 15,
-    "base_climate_temp": 27,       # avg outdoor temp for your city (C)
-    "climate_seasonal_swing": 8,   # +/- deg C across the year
-    "climate_daily_swing": 5,      # +/- deg C across a day
-}
+X = data[features]
+y = data[target]
 
-UA_EVAP_KW_PER_C = 0.07   # evaporator coil heat-transfer conductance
-UA_COND_KW_PER_C = 0.12   # condenser coil heat-transfer conductance
-COMPRESSOR_ETA = 0.50      # fraction of Carnot COP a real compressor achieves
+# Split the data to verify model accuracy on unseen conditions
+X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, random_state=42)
 
-FREEZE_POINT_C = 0.0
-FROST_MARGIN_C = 1.0       # keep coil >= freeze point + margin when frost risk exists
-MAX_REALISTIC_COP = 8.0    # practical ceiling (cycling losses, motor/drive inefficiency)
+# Train the Advanced Random Forest (Tuned Hyperparameters)
+print("Training Advanced Random Forest (500 Trees, Full Sensor Awareness)...")
+rf_advanced = RandomForestRegressor(
+    n_estimators=500, 
+    max_depth=None, 
+    min_samples_split=2, 
+    max_features=1.0, 
+    random_state=42, 
+    n_jobs=-1
+)
+rf_advanced.fit(X_train, y_train)
 
-REFRIGERANTS = {
-    "R32":   {"critical_temp_c": 78.11},
-    "R410A": {"critical_temp_c": 71.36},
-    "R134a": {"critical_temp_c": 101.06},
-}
-REFRIGERANT = "R32"
+# Verify precision mathematically
+predictions = rf_advanced.predict(X_valid)
+mae = mean_absolute_error(y_valid, predictions)
+print(f"Model successfully trained. Mean Absolute Error: {mae:.5f} kWh\n")
 
-COMFORT_MIN, COMFORT_MAX = 20, 26
-DAYS = 365
-OCCUPANCY_MIN, OCCUPANCY_MAX = 1, 4   # occupants per row: never 0, never more than 4
-NIGHT_HOURS = [22, 23, 0, 1, 2, 3, 4, 5]
+# ---------------------------------------------------------
+# 2. THE PHYSICS ENGINE (Thermodynamic Guardrails)
+# ---------------------------------------------------------
+def calculate_dew_point(temp_c, rh_percent):
+    """Calculates Dew Point using the Magnus-Tetens formula."""
+    a, b = 17.27, 237.3
+    alpha = ((a * temp_c) / (b + temp_c)) + np.log(rh_percent / 100.0)
+    return (b * alpha) / (a - alpha)
 
+def get_valid_Te_range(setpoint, humidity, outdoor_temp):
+    """Calculates the safe, physically possible Evaporation Temperature limits."""
+    dew_point = calculate_dew_point(setpoint, humidity)
+    
+    # Floor: Must stay safely above freezing (2.0 C)
+    min_Te = 2.0 
+    
+    # Ceiling: Must stay below Dew Point to dehumidify (with a 1C buffer)
+    max_Te = dew_point - 1.0 
+    
+    # Condensing Temp Sanity Check (Assuming R32 Refrigerant)
+    Tc_estimated = outdoor_temp + 12.0
+    T_crit_R32 = 78.1
+    if (T_crit_R32 - Tc_estimated) < 10.0:
+        min_Te = max(min_Te, 6.0) # Force higher T_e to protect the compressor
 
-# ---------------------------------------------------------------------
-# Weather / load model (same room physics as before)
-# ---------------------------------------------------------------------
-def outdoor_temp(day, hour_of_day):
-    seasonal = ROOM_PARAMS["climate_seasonal_swing"] * np.sin(2 * np.pi * day / 365)
-    daily = ROOM_PARAMS["climate_daily_swing"] * np.sin(2 * np.pi * (hour_of_day - 9) / 24)
-    return ROOM_PARAMS["base_climate_temp"] + seasonal + daily + np.random.normal(0, 0.6)
+    if min_Te >= max_Te:
+        return np.array([min_Te]) # Fallback if boundaries ever cross
+        
+    # Return array of testable targets, stepping by 0.5 degrees
+    return np.arange(min_Te, max_Te, 0.5) 
 
+# ---------------------------------------------------------
+# 3. THE OPTIMIZER (The "What-If" Loop)
+# ---------------------------------------------------------
+def optimize_expansion_valve(setpoint, humidity, outdoor_temp, occupancy, trained_model):
+    """Finds the most energy-efficient T_e within the safe physics boundaries."""
+    
+    # Step 1: Get the safe boundaries from the Physics Engine
+    valid_Te_options = get_valid_Te_range(setpoint, humidity, outdoor_temp)
+    
+    # Step 2: Build the "What-If" simulation scenarios
+    scenarios = pd.DataFrame({
+        'setpoint_c': [setpoint] * len(valid_Te_options),
+        'humidity_pct': [humidity] * len(valid_Te_options),
+        'outdoor_temp_c': [outdoor_temp] * len(valid_Te_options),
+        'occupancy': [occupancy] * len(valid_Te_options),
+        'evap_temp_c': valid_Te_options
+    })
+    
+    # Step 3: Use the Advanced ML Model to predict power for all scenarios instantly
+    predicted_work = trained_model.predict(scenarios)
+    
+    # Step 4: Pick the T_e that resulted in the lowest power consumption
+    best_idx = np.argmin(predicted_work)
+    
+    return valid_Te_options[best_idx], predicted_work[best_idx], valid_Te_options
 
-def cooling_load_kw(out_temp_c, setpoint_c, occupancy):
-    """Required heat removal rate (kW) to hold setpoint against outdoor heat gain."""
-    insulation = ROOM_PARAMS["insulation_quality"]
-    gap = max(0.0, out_temp_c - setpoint_c)  # only cooling load, not heating
-    leak_factor = 1.3 - insulation
-    base_load = gap * leak_factor * ROOM_PARAMS["room_area_m2"] * 0.03
-    occupancy_gain = occupancy * 0.15
-    return max(0.05, base_load + occupancy_gain)
-
-
-def dew_point_c(temp_c, rh_pct):
-    """Magnus-Tetens approximation."""
-    a, b = 17.62, 243.12
-    rh = np.clip(rh_pct, 1, 100) / 100.0
-    gamma = (a * temp_c) / (b + temp_c) + np.log(rh)
-    return (b * gamma) / (a - gamma)
-
-
-# ---------------------------------------------------------------------
-# Core cycle solver
-# ---------------------------------------------------------------------
-def solve_evap_temp(setpoint_c, load_kw, dew_pt_c):
-    """
-    Analytic evap temp needed to deliver `load_kw` while holding the
-    room at `setpoint_c`, then apply the frost constraint.
-    Returns (evap_temp_c, frost_limited: bool).
-    """
-    ideal_evap = setpoint_c - load_kw / UA_EVAP_KW_PER_C
-
-    frost_would_form = (ideal_evap < FREEZE_POINT_C) and (ideal_evap < dew_pt_c)
-    if frost_would_form:
-        floor = max(FREEZE_POINT_C + FROST_MARGIN_C, dew_pt_c)
-        # if dew point itself is below freezing there's no moisture to
-        # freeze, so only the freeze-point+margin floor applies
-        floor = FREEZE_POINT_C + FROST_MARGIN_C if dew_pt_c < FREEZE_POINT_C else floor
-        return floor, True
-    return ideal_evap, False
-
-
-def solve_condensing_cycle(evap_temp_c, load_kw, outdoor_temp_c, iterations=30):
-    """
-    Iteratively solve T_cond from the condenser heat balance
-    Q_cond = Q_evap + W_compressor, then check against the refrigerant's
-    critical temperature.
-    Returns (cond_temp_c, cop, work_kw, critical_point_exceeded: bool).
-    """
-    t_cond = outdoor_temp_c + 10.0  # initial guess (approach temp)
-    cop, work_kw = None, None
-
-    for _ in range(iterations):
-        t_evap_k = evap_temp_c + 273.15
-        t_cond_k = t_cond + 273.15
-        delta_t = max(t_cond_k - t_evap_k, 0.5)  # avoid divide-by-zero
-        cop = min(COMPRESSOR_ETA * (t_evap_k / delta_t), MAX_REALISTIC_COP)
-        work_kw = load_kw / cop
-        q_cond_kw = load_kw + work_kw
-        t_cond_new = outdoor_temp_c + q_cond_kw / UA_COND_KW_PER_C
-        t_cond = 0.5 * t_cond + 0.5 * t_cond_new  # damped update for stability
-
-    critical_temp = REFRIGERANTS[REFRIGERANT]["critical_temp_c"]
-    exceeded = t_cond >= critical_temp
-    if exceeded:
-        # infeasible operating point -- cap at just below critical and
-        # recompute so downstream numbers stay finite (row gets flagged)
-        t_cond = critical_temp - 0.5
-        t_evap_k = evap_temp_c + 273.15
-        t_cond_k = t_cond + 273.15
-        cop = min(COMPRESSOR_ETA * (t_evap_k / max(t_cond_k - t_evap_k, 0.5)), MAX_REALISTIC_COP)
-        work_kw = load_kw / cop
-
-    return t_cond, cop, work_kw, exceeded
-
-
-def solve_row(outdoor_temp_c, setpoint_c, rh_pct, occupancy):
-    load_kw = cooling_load_kw(outdoor_temp_c, setpoint_c, occupancy)
-    dew_pt = dew_point_c(setpoint_c, rh_pct)  # dew point of room air, not outdoor
-    evap_temp_c, frost_limited = solve_evap_temp(setpoint_c, load_kw, dew_pt)
-    cond_temp_c, cop, work_kw, crit_exceeded = solve_condensing_cycle(
-        evap_temp_c, load_kw, outdoor_temp_c
-    )
-    return {
-        "load_kw": round(load_kw, 4),
-        "dew_point_c": round(dew_pt, 2),
-        "evap_temp_c": round(evap_temp_c, 2),
-        "frost_limited": frost_limited,
-        "cond_temp_c": round(cond_temp_c, 2),
-        "critical_point_exceeded": crit_exceeded,
-        "cop": round(cop, 3),
-        "compressor_work_kwh": round(work_kw, 4),  # 1-hour timestep -> kWh == kW
-    }
-
-
-# ---------------------------------------------------------------------
-# Dataset generation (night hours only, matching the earlier dataset)
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------
+# 4. LIVE SYSTEM RUN
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    rows = []
-    for day in range(DAYS):
-        for hour_of_day in NIGHT_HOURS:
-            out_t = outdoor_temp(day, hour_of_day)
-            setpoint_c = round(np.clip(np.random.normal(23, 1.5), COMFORT_MIN, COMFORT_MAX), 1)
-            rh_pct = round(np.clip(np.random.normal(55, 12), 20, 95), 1)
-            occupancy = int(np.random.randint(OCCUPANCY_MIN, OCCUPANCY_MAX + 1))
+    # Simulated live sensors reading from the room
+    live_setpoint = 24.0
+    live_humidity = 72.0
+    live_outdoor = 34.5
+    live_occupancy = 3
 
-            result = solve_row(out_t, setpoint_c, rh_pct, occupancy)
+    # Execute the optimization loop
+    optimal_Te, min_work, valid_range = optimize_expansion_valve(
+        live_setpoint, live_humidity, live_outdoor, live_occupancy, rf_advanced
+    )
 
-            rows.append({
-                "day": day,
-                "hour_of_day": hour_of_day,
-                "outdoor_temp_c": round(out_t, 2),
-                "setpoint_c": setpoint_c,
-                "humidity_pct": rh_pct,
-                "occupancy": occupancy,
-                "refrigerant": REFRIGERANT,
-                **result,
-            })
-
-    df = pd.DataFrame(rows)
-    out_path = "/mnt/user-data/outputs/single_room_evap_temp_data.csv"
-    df.to_csv(out_path, index=False)
-    print(f"Saved {len(df)} rows to {out_path}")
-    print(f"Frost-limited rows: {df['frost_limited'].sum()}")
-    print(f"Critical-point-exceeded rows: {df['critical_point_exceeded'].sum()}")
-    print(df.head(10).to_string())
+    # Output the final command
+    print("--- LIVE SYSTEM OPTIMIZATION ---")
+    print(f"Sensor Readings: {live_outdoor}°C Outdoor | {live_humidity}% RH | {live_occupancy} Occupants | {live_setpoint}°C Setpoint")
+    print(f"Physics Guardrails: Testing safe T_e states from {valid_range[0]:.1f}°C to {valid_range[-1]:.1f}°C")
+    print(f">> COMMAND EEV TARGET (Optimal T_e) : {optimal_Te:.1f}°C")
+    print(f">> PREDICTED MINIMUM COMPRESSOR WORK: {min_work:.4f} kWh")
